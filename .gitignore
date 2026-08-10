@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+env/
+.DS_Store
+DATASET/
+*.rar
+*.zip
+.env
+.env.*
+!.env.example
+
+# NOTE: do NOT ignore these -- the deployed Streamlit app requires them:
+# model_sem_burst.onnx
+# model_sem_burst.onnx.data
+# model_sem_burst.onnx.class_mapping.json
