@@ -1,14 +1,20 @@
 """
-SEM Defect Classification -- Streamlit demo.
+SEM Defect Classification - Streamlit App
 
-Uses ONLY model_sem_burst.onnx via ONNX Runtime. Does NOT import torch and
-does NOT load best_sem_model_burst.pth -- this app is meant to demonstrate
-the ONNX deployment path verified in Phase 3, independent of the training
-stack.
+Supports:
+- Single or multiple SEM image uploads
+- ONNX Runtime inference
+- Batch progress tracking
+- Results table
+- CSV export
+- Class distribution
+- Per-image inspection
 
-Run:
-    streamlit run app.py
+No PyTorch is required at runtime.
 """
+
+import csv
+import io
 import json
 import time
 from pathlib import Path
@@ -18,120 +24,496 @@ import onnxruntime as ort
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
-# Reuse the exact preprocessing already verified against PyTorch in Phase 3
-# (compare_pytorch_onnx.py showed 100% prediction agreement using this same
-# function via onnx_only_inference.py). Importing it here avoids duplicating
-# and risking preprocessing drift between the two.
 from onnx_only_inference import preprocess
 
-# Resolve paths relative to this file's own directory, not the process's
-# current working directory -- so `streamlit run app.py` works the same way
-# regardless of where it's launched from (e.g. from a parent folder, or via
-# a launcher script that cd's elsewhere first).
+
+# ---------------------------------------------------------
+# Paths
+# ---------------------------------------------------------
+
 APP_DIR = Path(__file__).resolve().parent
+
 ONNX_MODEL_PATH = APP_DIR / "model_sem_burst.onnx"
 CLASS_MAPPING_PATH = APP_DIR / "model_sem_burst.onnx.class_mapping.json"
-# model_sem_burst.onnx.data is loaded implicitly by ONNX Runtime -- it looks
-# for it next to the .onnx file using the same directory, so as long as
-# ONNX_MODEL_PATH is correct, the external-data file resolves automatically.
 
-# Must match detector.py's NO_DEFECT_LABELS["sem"] = {"Clean"} (verified in
-# tests/test_detector.py). Kept as a plain constant here, rather than
-# importing detector.py, because detector.py imports torch and this app is
-# required to stay PyTorch-free.
 NO_DEFECT_LABEL = "Clean"
 
 
-@st.cache_resource
-def load_session_and_classes():
-    if not ONNX_MODEL_PATH.exists():
-        raise FileNotFoundError(f"ONNX model not found: {ONNX_MODEL_PATH}")
-    if not CLASS_MAPPING_PATH.exists():
-        raise FileNotFoundError(f"Class mapping not found: {CLASS_MAPPING_PATH}")
+# ---------------------------------------------------------
+# Load ONNX model once
+# ---------------------------------------------------------
 
-    session = ort.InferenceSession(str(ONNX_MODEL_PATH), providers=["CPUExecutionProvider"])
-    with open(CLASS_MAPPING_PATH) as f:
-        mapping = json.load(f)
-    classes = mapping["classes"]
+@st.cache_resource
+def load_model():
+    if not ONNX_MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Model not found: {ONNX_MODEL_PATH}"
+        )
+
+    if not CLASS_MAPPING_PATH.exists():
+        raise FileNotFoundError(
+            f"Class mapping not found: {CLASS_MAPPING_PATH}"
+        )
+
+    session = ort.InferenceSession(
+        str(ONNX_MODEL_PATH),
+        providers=["CPUExecutionProvider"],
+    )
+
+    with open(CLASS_MAPPING_PATH, encoding="utf-8") as f:
+        classes = json.load(f)["classes"]
 
     if NO_DEFECT_LABEL not in classes:
         raise ValueError(
-            f"Expected no-defect label '{NO_DEFECT_LABEL}' not found in classes {classes}. "
-            f"Refusing to start -- defect/no-defect status would be wrong for every prediction."
+            f"'{NO_DEFECT_LABEL}' not found in class list: {classes}"
         )
+
     return session, classes
 
 
-def run_inference(session, classes, image: Image.Image):
+# ---------------------------------------------------------
+# Single image inference
+# ---------------------------------------------------------
+
+def run_inference(session, classes, image):
     x = preprocess(image)
+
     input_name = session.get_inputs()[0].name
 
     start = time.perf_counter()
-    out = session.run(None, {input_name: x})[0]
-    latency_ms = (time.perf_counter() - start) * 1000.0
 
-    logits = out[0]
-    probs = np.exp(logits - np.max(logits))
-    probs = probs / np.sum(probs)
-    pred_idx = int(np.argmax(probs))
-    pred_class = classes[pred_idx]
-    confidence = float(probs[pred_idx])
-    has_defect = pred_class != NO_DEFECT_LABEL
+    output = session.run(
+        None,
+        {input_name: x},
+    )[0]
 
-    return pred_class, confidence, has_defect, latency_ms
+    latency_ms = (time.perf_counter() - start) * 1000
+
+    logits = output[0]
+
+    # Stable softmax
+    logits = logits - np.max(logits)
+    probabilities = np.exp(logits)
+    probabilities /= np.sum(probabilities)
+
+    prediction_index = int(np.argmax(probabilities))
+
+    prediction = classes[prediction_index]
+    confidence = float(probabilities[prediction_index])
+
+    status = (
+        "NO DEFECT"
+        if prediction == NO_DEFECT_LABEL
+        else "DEFECT DETECTED"
+    )
+
+    return prediction, confidence, status, latency_ms
 
 
-def main():
-    st.set_page_config(page_title="SEM Defect Classification", page_icon=None, layout="centered")
+# ---------------------------------------------------------
+# Process one uploaded file
+# ---------------------------------------------------------
 
-    st.title("SEM Defect Classification")
-    st.caption("ONNX Runtime inference -- model_sem_burst.onnx")
-
-    try:
-        session, classes = load_session_and_classes()
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        st.stop()
-
-    with st.expander("Model info"):
-        st.write(f"Classes ({len(classes)}): {classes}")
-        st.write(f"No-defect label: {NO_DEFECT_LABEL}")
-        st.write(f"Backend: ONNX Runtime, providers={session.get_providers()}")
-
-    uploaded_file = st.file_uploader("Upload SEM Image", type=["jpg", "jpeg", "png"])
-
-    if uploaded_file is None:
-        st.info("Upload a .jpg, .jpeg, or .png SEM image to classify.")
-        return
+def process_file(uploaded_file, session, classes):
+    filename = uploaded_file.name
 
     try:
         image = Image.open(uploaded_file)
-        image.load()  # force decode now, so corrupt files fail here, not later
-    except (UnidentifiedImageError, OSError) as e:
-        st.error(f"Could not read this file as an image ({e}). Please upload a valid JPG or PNG.")
+        image.load()
+        image = image.convert("RGB")
+
+        prediction, confidence, status, latency_ms = run_inference(
+            session,
+            classes,
+            image,
+        )
+
+        return {
+            "filename": filename,
+            "prediction": prediction,
+            "confidence": confidence,
+            "status": status,
+            "latency_ms": latency_ms,
+            "error": "",
+            "image": image,
+        }
+
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        RuntimeError,
+    ) as error:
+
+        return {
+            "filename": filename,
+            "prediction": "",
+            "confidence": None,
+            "status": "ERROR",
+            "latency_ms": None,
+            "error": str(error),
+            "image": None,
+        }
+
+
+# ---------------------------------------------------------
+# CSV generation
+# ---------------------------------------------------------
+
+def create_csv(results):
+    output = io.StringIO()
+
+    writer = csv.writer(output)
+
+    writer.writerow(
+        [
+            "Filename",
+            "Prediction",
+            "Confidence (%)",
+            "Status",
+            "Latency (ms)",
+            "Error",
+        ]
+    )
+
+    for result in results:
+        confidence = result["confidence"]
+
+        writer.writerow(
+            [
+                result["filename"],
+                result["prediction"],
+                (
+                    f"{confidence * 100:.2f}"
+                    if confidence is not None
+                    else ""
+                ),
+                result["status"],
+                (
+                    f"{result['latency_ms']:.2f}"
+                    if result["latency_ms"] is not None
+                    else ""
+                ),
+                result["error"],
+            ]
+        )
+
+    return output.getvalue()
+
+
+# ---------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------
+
+def main():
+
+    st.set_page_config(
+        page_title="SEM Defect Classification",
+        page_icon="🔬",
+        layout="wide",
+    )
+
+    st.title("🔬 SEM Defect Classification")
+
+    st.caption(
+        "Edge AI semiconductor defect detection using "
+        "ONNX Runtime"
+    )
+
+    # -----------------------------------------------------
+    # Load model
+    # -----------------------------------------------------
+
+    try:
+        session, classes = load_model()
+
+    except Exception as error:
+        st.error(f"Failed to load model: {error}")
+        st.stop()
+
+    # -----------------------------------------------------
+    # Model information
+    # -----------------------------------------------------
+
+    with st.expander("Model Information"):
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric("Classes", len(classes))
+
+        with col2:
+            st.metric("Backend", "ONNX Runtime")
+
+        with col3:
+            st.metric("Input Size", "96 × 96")
+
+        st.write("Classes:")
+        st.write(", ".join(classes))
+
+        st.write(
+            f"No-defect class: **{NO_DEFECT_LABEL}**"
+        )
+
+    # -----------------------------------------------------
+    # Upload
+    # -----------------------------------------------------
+
+    uploaded_files = st.file_uploader(
+        "Upload SEM image(s)",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+        help="You can select one or multiple SEM images.",
+    )
+
+    if not uploaded_files:
+
+        st.info(
+            "Upload one or multiple SEM images to start classification."
+        )
+
         return
 
-    st.image(image, caption="Uploaded image", use_container_width=True)
+    # -----------------------------------------------------
+    # Batch processing
+    # -----------------------------------------------------
 
-    with st.spinner("Running ONNX inference..."):
-        try:
-            pred_class, confidence, has_defect, latency_ms = run_inference(session, classes, image)
-        except Exception as e:
-            st.error(f"Inference failed: {e}")
-            return
+    st.subheader(
+        f"Processing {len(uploaded_files)} image(s)"
+    )
 
-    st.subheader("Result")
-    col1, col2 = st.columns(2)
+    progress_bar = st.progress(0)
+
+    status_text = st.empty()
+
+    results = []
+
+    total = len(uploaded_files)
+
+    for index, uploaded_file in enumerate(uploaded_files):
+
+        status_text.write(
+            f"Processing {index + 1} / {total}: "
+            f"{uploaded_file.name}"
+        )
+
+        result = process_file(
+            uploaded_file,
+            session,
+            classes,
+        )
+
+        results.append(result)
+
+        progress_bar.progress(
+            (index + 1) / total
+        )
+
+    status_text.success(
+        f"Finished processing {total} image(s)."
+    )
+
+    # -----------------------------------------------------
+    # Summary
+    # -----------------------------------------------------
+
+    successful = [
+        r for r in results
+        if r["status"] != "ERROR"
+    ]
+
+    failed = [
+        r for r in results
+        if r["status"] == "ERROR"
+    ]
+
+    defects = [
+        r for r in successful
+        if r["status"] == "DEFECT DETECTED"
+    ]
+
+    clean = [
+        r for r in successful
+        if r["status"] == "NO DEFECT"
+    ]
+
+    latencies = [
+        r["latency_ms"]
+        for r in successful
+        if r["latency_ms"] is not None
+    ]
+
+    average_latency = (
+        sum(latencies) / len(latencies)
+        if latencies
+        else 0
+    )
+
+    st.subheader("Batch Summary")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
     with col1:
-        st.metric("Prediction", pred_class)
-        st.metric("Confidence", f"{confidence * 100:.1f}%")
+        st.metric("Total", total)
+
     with col2:
-        status = "DEFECT DETECTED" if has_defect else "NO DEFECT"
-        if has_defect:
-            st.error(f"Status: {status}")
-        else:
-            st.success(f"Status: {status}")
-        st.metric("Inference Latency", f"{latency_ms:.2f} ms")
+        st.metric("Successful", len(successful))
+
+    with col3:
+        st.metric("Failed", len(failed))
+
+    with col4:
+        st.metric("Defects", len(defects))
+
+    with col5:
+        st.metric("Clean", len(clean))
+
+    st.metric(
+        "Average Inference Latency",
+        f"{average_latency:.2f} ms",
+    )
+
+    # -----------------------------------------------------
+    # Results table
+    # -----------------------------------------------------
+
+    st.subheader("Classification Results")
+
+    table_data = []
+
+    for result in results:
+
+        confidence = result["confidence"]
+
+        table_data.append(
+            {
+                "Filename": result["filename"],
+                "Prediction": result["prediction"],
+                "Confidence": (
+                    f"{confidence * 100:.1f}%"
+                    if confidence is not None
+                    else "-"
+                ),
+                "Status": result["status"],
+                "Latency": (
+                    f"{result['latency_ms']:.2f} ms"
+                    if result["latency_ms"] is not None
+                    else "-"
+                ),
+                "Error": result["error"],
+            }
+        )
+
+    st.dataframe(
+        table_data,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # -----------------------------------------------------
+    # CSV download
+    # -----------------------------------------------------
+
+    csv_data = create_csv(results)
+
+    st.download_button(
+        label="Download Results as CSV",
+        data=csv_data,
+        file_name="sem_classification_results.csv",
+        mime="text/csv",
+    )
+
+    # -----------------------------------------------------
+    # Class distribution
+    # -----------------------------------------------------
+
+    st.subheader("Class Distribution")
+
+    class_counts = {
+        class_name: 0
+        for class_name in classes
+    }
+
+    for result in successful:
+
+        prediction = result["prediction"]
+
+        if prediction in class_counts:
+            class_counts[prediction] += 1
+
+    st.bar_chart(class_counts)
+
+    # -----------------------------------------------------
+    # Individual image inspection
+    # -----------------------------------------------------
+
+    st.subheader("Inspect Individual Image")
+
+    selectable_results = [
+        r for r in results
+        if r["image"] is not None
+    ]
+
+    if selectable_results:
+
+        selected_filename = st.selectbox(
+            "Select an image",
+            [
+                r["filename"]
+                for r in selectable_results
+            ],
+        )
+
+        selected = next(
+            r
+            for r in selectable_results
+            if r["filename"] == selected_filename
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            st.image(
+                selected["image"],
+                caption=selected["filename"],
+                width="stretch",
+            )
+
+        with col2:
+
+            st.write(
+                f"### Prediction: {selected['prediction']}"
+            )
+
+            st.write(
+                f"**Confidence:** "
+                f"{selected['confidence'] * 100:.2f}%"
+            )
+
+            st.write(
+                f"**Status:** {selected['status']}"
+            )
+
+            st.write(
+                f"**Inference latency:** "
+                f"{selected['latency_ms']:.2f} ms"
+            )
+
+    # -----------------------------------------------------
+    # Errors
+    # -----------------------------------------------------
+
+    if failed:
+
+        st.subheader("Files That Failed")
+
+        for result in failed:
+
+            st.error(
+                f"{result['filename']}: "
+                f"{result['error']}"
+            )
 
 
 if __name__ == "__main__":
