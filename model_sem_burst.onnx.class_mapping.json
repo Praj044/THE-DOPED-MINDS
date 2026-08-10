@@ -1,0 +1,22 @@
+{
+  "classes": [
+    "Bridge",
+    "CMP scratch",
+    "Clean",
+    "LER",
+    "crack",
+    "manforsed via",
+    "open",
+    "short"
+  ],
+  "class_to_idx": {
+    "Bridge": 0,
+    "CMP scratch": 1,
+    "Clean": 2,
+    "LER": 3,
+    "crack": 4,
+    "manforsed via": 5,
+    "open": 6,
+    "short": 7
+  }
+}
