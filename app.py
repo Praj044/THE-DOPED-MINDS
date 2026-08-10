@@ -1,16 +1,19 @@
 """
-SEM Defect Classification - Streamlit App
+SEM Defect Classification -- Streamlit App
 
-Supports:
-- Single or multiple SEM image uploads
+Features:
+- Single and multiple SEM image uploads
 - ONNX Runtime inference
+- Basic SEM/non-SEM input validation
+- Per-image prediction, confidence, status, latency
 - Batch progress tracking
-- Results table
+- Batch summary
+- Classification results table
 - CSV export
 - Class distribution
-- Per-image inspection
+- Individual image inspection
 
-No PyTorch is required at runtime.
+Deployment path is PyTorch-free.
 """
 
 import csv
@@ -27,27 +30,45 @@ from PIL import Image, UnidentifiedImageError
 from onnx_only_inference import preprocess
 
 
-# ---------------------------------------------------------
-# Paths
-# ---------------------------------------------------------
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-APP_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
 
-ONNX_MODEL_PATH = APP_DIR / "model_sem_burst.onnx"
-CLASS_MAPPING_PATH = APP_DIR / "model_sem_burst.onnx.class_mapping.json"
+ONNX_MODEL_PATH = BASE_DIR / "model_sem_burst.onnx"
+
+CLASS_MAPPING_PATH = (
+    BASE_DIR / "model_sem_burst.onnx.class_mapping.json"
+)
 
 NO_DEFECT_LABEL = "Clean"
 
 
-# ---------------------------------------------------------
-# Load ONNX model once
-# ---------------------------------------------------------
+# =========================================================
+# PAGE CONFIG
+# =========================================================
+
+st.set_page_config(
+    page_title="SEM Defect Classification",
+    page_icon="🔬",
+    layout="wide",
+)
+
+
+# =========================================================
+# MODEL LOADING
+# =========================================================
 
 @st.cache_resource
-def load_model():
+def load_session_and_classes():
+    """
+    Load ONNX model and class mapping once.
+    """
+
     if not ONNX_MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Model not found: {ONNX_MODEL_PATH}"
+            f"ONNX model not found: {ONNX_MODEL_PATH}"
         )
 
     if not CLASS_MAPPING_PATH.exists():
@@ -60,22 +81,186 @@ def load_model():
         providers=["CPUExecutionProvider"],
     )
 
-    with open(CLASS_MAPPING_PATH, encoding="utf-8") as f:
-        classes = json.load(f)["classes"]
+    with open(
+        CLASS_MAPPING_PATH,
+        "r",
+        encoding="utf-8",
+    ) as f:
+        mapping = json.load(f)
+
+    classes = mapping["classes"]
 
     if NO_DEFECT_LABEL not in classes:
         raise ValueError(
-            f"'{NO_DEFECT_LABEL}' not found in class list: {classes}"
+            f"Expected no-defect label '{NO_DEFECT_LABEL}' "
+            f"not found in classes {classes}. "
+            "Refusing to start because defect/no-defect "
+            "status could be incorrect."
         )
 
     return session, classes
 
 
-# ---------------------------------------------------------
-# Single image inference
-# ---------------------------------------------------------
+# =========================================================
+# SEM IMAGE VALIDATION
+# =========================================================
+
+def is_likely_sem_image(image):
+    """
+    Basic safety validation to reject obviously non-SEM images.
+
+    This is NOT a trained SEM-vs-non-SEM classifier.
+
+    It is intended to reject common non-SEM inputs such as:
+    - signatures
+    - documents
+    - certificates
+    - screenshots
+    - strongly colored photographs
+    - nearly blank images
+    - extremely low-detail images
+    """
+
+    image = image.convert("RGB")
+
+    width, height = image.size
+
+    # -----------------------------------------------------
+    # 1. Resolution validation
+    # -----------------------------------------------------
+
+    if width < 64 or height < 64:
+        return False, "Image resolution is too small."
+
+    # -----------------------------------------------------
+    # 2. Convert image to numpy
+    # -----------------------------------------------------
+
+    arr = np.asarray(image).astype(np.float32)
+
+    gray = np.asarray(
+        image.convert("L")
+    ).astype(np.float32)
+
+    # -----------------------------------------------------
+    # 3. Color validation
+    # -----------------------------------------------------
+
+    channel_difference = np.mean(
+        np.abs(arr[:, :, 0] - arr[:, :, 1])
+        + np.abs(arr[:, :, 1] - arr[:, :, 2])
+    )
+
+    # Strongly colored photographs are unlikely to be SEM.
+    if channel_difference > 35:
+        return (
+            False,
+            "Image does not appear to be a grayscale SEM image.",
+        )
+
+    # -----------------------------------------------------
+    # 4. Image statistics
+    # -----------------------------------------------------
+
+    mean_intensity = float(np.mean(gray))
+    texture_strength = float(np.std(gray))
+
+    bright_ratio = float(
+        np.mean(gray > 245)
+    )
+
+    dark_ratio = float(
+        np.mean(gray < 30)
+    )
+
+    # -----------------------------------------------------
+    # 5. Gradient / edge estimation
+    # -----------------------------------------------------
+
+    gx = np.abs(np.diff(gray, axis=1))
+    gy = np.abs(np.diff(gray, axis=0))
+
+    edge_strength = float(
+        np.mean(gx) + np.mean(gy)
+    )
+
+    # -----------------------------------------------------
+    # 6. Reject mostly blank images
+    # -----------------------------------------------------
+
+    if bright_ratio > 0.92:
+        return (
+            False,
+            "Image appears to be mostly blank and "
+            "does not look like an SEM image.",
+        )
+
+    # -----------------------------------------------------
+    # 7. Reject mostly black images
+    # -----------------------------------------------------
+
+    if dark_ratio > 0.92:
+        return (
+            False,
+            "Image contains insufficient visible structure "
+            "for SEM classification.",
+        )
+
+    # -----------------------------------------------------
+    # 8. Signature / document style detection
+    # -----------------------------------------------------
+    #
+    # Many signatures and document scans have:
+    # - mostly white background
+    # - relatively small dark foreground
+    # - low texture
+    #
+    # This is deliberately conservative.
+
+    if (
+        bright_ratio > 0.70
+        and dark_ratio < 0.15
+        and texture_strength < 70
+    ):
+        return (
+            False,
+            "Image appears to contain a mostly blank "
+            "background and does not look like an SEM image.",
+        )
+
+    # -----------------------------------------------------
+    # 9. Very low texture
+    # -----------------------------------------------------
+
+    if texture_strength < 15:
+        return (
+            False,
+            "Image has insufficient texture for a typical SEM image.",
+        )
+
+    # -----------------------------------------------------
+    # 10. Very low structural detail
+    # -----------------------------------------------------
+
+    if edge_strength < 8:
+        return (
+            False,
+            "Image does not contain enough structural detail "
+            "for a typical SEM image.",
+        )
+
+    return True, ""
+
+
+# =========================================================
+# ONNX INFERENCE
+# =========================================================
 
 def run_inference(session, classes, image):
+    """
+    Run ONNX inference on a single validated image.
+    """
+
     x = preprocess(image)
 
     input_name = session.get_inputs()[0].name
@@ -84,22 +269,36 @@ def run_inference(session, classes, image):
 
     output = session.run(
         None,
-        {input_name: x},
+        {
+            input_name: x
+        },
     )[0]
 
-    latency_ms = (time.perf_counter() - start) * 1000
+    latency_ms = (
+        time.perf_counter() - start
+    ) * 1000.0
 
     logits = output[0]
 
+    # -----------------------------------------------------
     # Stable softmax
+    # -----------------------------------------------------
+
     logits = logits - np.max(logits)
+
     probabilities = np.exp(logits)
+
     probabilities /= np.sum(probabilities)
 
-    prediction_index = int(np.argmax(probabilities))
+    prediction_index = int(
+        np.argmax(probabilities)
+    )
 
     prediction = classes[prediction_index]
-    confidence = float(probabilities[prediction_index])
+
+    confidence = float(
+        probabilities[prediction_index]
+    )
 
     status = (
         "NO DEFECT"
@@ -107,22 +306,77 @@ def run_inference(session, classes, image):
         else "DEFECT DETECTED"
     )
 
-    return prediction, confidence, status, latency_ms
+    return (
+        prediction,
+        confidence,
+        status,
+        latency_ms,
+    )
 
 
-# ---------------------------------------------------------
-# Process one uploaded file
-# ---------------------------------------------------------
+# =========================================================
+# PROCESS ONE IMAGE
+# =========================================================
 
-def process_file(uploaded_file, session, classes):
+def process_uploaded_file(
+    uploaded_file,
+    session,
+    classes,
+):
+    """
+    Process one uploaded image.
+
+    Validation happens BEFORE ONNX inference.
+
+    A rejected/non-SEM image does not reach the
+    defect classification model.
+    """
+
     filename = uploaded_file.name
 
     try:
+
+        # -------------------------------------------------
+        # Load image
+        # -------------------------------------------------
+
         image = Image.open(uploaded_file)
+
+        # Force actual image decoding
         image.load()
+
         image = image.convert("RGB")
 
-        prediction, confidence, status, latency_ms = run_inference(
+        # -------------------------------------------------
+        # SEM validation
+        # -------------------------------------------------
+
+        valid, validation_message = (
+            is_likely_sem_image(image)
+        )
+
+        if not valid:
+
+            return {
+                "filename": filename,
+                "prediction": "",
+                "confidence": None,
+                "status": "INVALID INPUT",
+                "latency_ms": None,
+                "error": validation_message,
+                "image": image,
+            }
+
+        # -------------------------------------------------
+        # ONNX inference
+        # -------------------------------------------------
+
+        (
+            prediction,
+            confidence,
+            status,
+            latency_ms,
+        ) = run_inference(
             session,
             classes,
             image,
@@ -143,7 +397,7 @@ def process_file(uploaded_file, session, classes):
         OSError,
         ValueError,
         RuntimeError,
-    ) as error:
+    ) as e:
 
         return {
             "filename": filename,
@@ -151,16 +405,20 @@ def process_file(uploaded_file, session, classes):
             "confidence": None,
             "status": "ERROR",
             "latency_ms": None,
-            "error": str(error),
+            "error": str(e),
             "image": None,
         }
 
 
-# ---------------------------------------------------------
-# CSV generation
-# ---------------------------------------------------------
+# =========================================================
+# CSV GENERATION
+# =========================================================
 
 def create_csv(results):
+    """
+    Convert classification results to CSV.
+    """
+
     output = io.StringIO()
 
     writer = csv.writer(output)
@@ -169,7 +427,7 @@ def create_csv(results):
         [
             "Filename",
             "Prediction",
-            "Confidence (%)",
+            "Confidence",
             "Status",
             "Latency (ms)",
             "Error",
@@ -177,23 +435,30 @@ def create_csv(results):
     )
 
     for result in results:
+
         confidence = result["confidence"]
+
+        if confidence is None:
+            confidence_text = ""
+        else:
+            confidence_text = (
+                f"{confidence * 100:.2f}%"
+            )
+
+        latency = result["latency_ms"]
+
+        if latency is None:
+            latency_text = ""
+        else:
+            latency_text = f"{latency:.2f}"
 
         writer.writerow(
             [
                 result["filename"],
                 result["prediction"],
-                (
-                    f"{confidence * 100:.2f}"
-                    if confidence is not None
-                    else ""
-                ),
+                confidence_text,
                 result["status"],
-                (
-                    f"{result['latency_ms']:.2f}"
-                    if result["latency_ms"] is not None
-                    else ""
-                ),
+                latency_text,
                 result["error"],
             ]
         )
@@ -201,181 +466,296 @@ def create_csv(results):
     return output.getvalue()
 
 
-# ---------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------
+# =========================================================
+# MAIN APPLICATION
+# =========================================================
 
 def main():
 
-    st.set_page_config(
-        page_title="SEM Defect Classification",
-        page_icon="🔬",
-        layout="wide",
-    )
+    # =====================================================
+    # HEADER
+    # =====================================================
 
     st.title("🔬 SEM Defect Classification")
 
     st.caption(
-        "Edge AI semiconductor defect detection using "
-        "ONNX Runtime"
+        "Edge AI semiconductor defect detection using ONNX Runtime"
     )
 
-    # -----------------------------------------------------
-    # Load model
-    # -----------------------------------------------------
+    # =====================================================
+    # LOAD MODEL
+    # =====================================================
 
     try:
-        session, classes = load_model()
 
-    except Exception as error:
-        st.error(f"Failed to load model: {error}")
+        session, classes = (
+            load_session_and_classes()
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"Unable to load the classification model: {e}"
+        )
+
         st.stop()
 
-    # -----------------------------------------------------
-    # Model information
-    # -----------------------------------------------------
+    # =====================================================
+    # MODEL INFORMATION
+    # =====================================================
 
-    with st.expander("Model Information"):
+    with st.expander(
+        "Model Information",
+        expanded=False,
+    ):
 
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.metric("Classes", len(classes))
+            st.write("**Inference Engine**")
+            st.write("ONNX Runtime")
 
         with col2:
-            st.metric("Backend", "ONNX Runtime")
+            st.write("**Execution Provider**")
+            st.write("CPU")
 
         with col3:
-            st.metric("Input Size", "96 × 96")
-
-        st.write("Classes:")
-        st.write(", ".join(classes))
+            st.write("**Classes**")
+            st.write(", ".join(classes))
 
         st.write(
-            f"No-defect class: **{NO_DEFECT_LABEL}**"
+            "**Input validation:** "
+            "Basic SEM/non-SEM safety filter enabled"
         )
 
-    # -----------------------------------------------------
-    # Upload
-    # -----------------------------------------------------
+    # =====================================================
+    # IMAGE UPLOAD
+    # =====================================================
+
+    st.subheader("Upload SEM Image(s)")
 
     uploaded_files = st.file_uploader(
-        "Upload SEM image(s)",
-        type=["jpg", "jpeg", "png"],
+        "Upload one or more SEM images",
+        type=[
+            "jpg",
+            "jpeg",
+            "png",
+            "bmp",
+            "tif",
+            "tiff",
+        ],
         accept_multiple_files=True,
-        help="You can select one or multiple SEM images.",
+        help=(
+            "Upload SEM images for defect classification. "
+            "Non-SEM images such as signatures or documents "
+            "may be rejected before inference."
+        ),
     )
+
+    # =====================================================
+    # NO FILE
+    # =====================================================
 
     if not uploaded_files:
 
         st.info(
-            "Upload one or multiple SEM images to start classification."
+            "Upload one or more SEM images to begin classification."
         )
 
         return
 
-    # -----------------------------------------------------
-    # Batch processing
-    # -----------------------------------------------------
+    # =====================================================
+    # DISPLAY UPLOAD COUNT
+    # =====================================================
 
-    st.subheader(
-        f"Processing {len(uploaded_files)} image(s)"
+    st.write(
+        f"**{len(uploaded_files)} image(s) selected**"
     )
 
-    progress_bar = st.progress(0)
+    # =====================================================
+    # PREVIEW UPLOADS
+    # =====================================================
 
-    status_text = st.empty()
+    with st.expander(
+        "View uploaded files",
+        expanded=False,
+    ):
 
-    results = []
+        for file in uploaded_files:
 
-    total = len(uploaded_files)
+            st.write(
+                f"📄 {file.name} "
+                f"({file.size / 1024:.1f} KB)"
+            )
 
-    for index, uploaded_file in enumerate(uploaded_files):
+    # =====================================================
+    # PROCESS BUTTON
+    # =====================================================
 
-        status_text.write(
-            f"Processing {index + 1} / {total}: "
-            f"{uploaded_file.name}"
+    if st.button(
+        "🚀 Run Classification",
+        type="primary",
+        width="stretch",
+    ):
+
+        results = []
+
+        total_images = len(uploaded_files)
+
+        progress_bar = st.progress(0)
+
+        progress_text = st.empty()
+
+        # -------------------------------------------------
+        # Process images
+        # -------------------------------------------------
+
+        for index, uploaded_file in enumerate(
+            uploaded_files
+        ):
+
+            progress_text.write(
+                f"Processing image "
+                f"{index + 1} of {total_images}: "
+                f"`{uploaded_file.name}`"
+            )
+
+            result = process_uploaded_file(
+                uploaded_file,
+                session,
+                classes,
+            )
+
+            results.append(result)
+
+            progress_bar.progress(
+                (index + 1) / total_images
+            )
+
+        progress_text.empty()
+
+        st.success(
+            f"Finished processing {total_images} image(s)."
         )
 
-        result = process_file(
-            uploaded_file,
-            session,
-            classes,
-        )
+        # Save results in session state so the user
+        # can interact with them after reruns.
 
-        results.append(result)
+        st.session_state["results"] = results
 
-        progress_bar.progress(
-            (index + 1) / total
-        )
+    # =====================================================
+    # DISPLAY RESULTS
+    # =====================================================
 
-    status_text.success(
-        f"Finished processing {total} image(s)."
+    if "results" not in st.session_state:
+
+        return
+
+    results = st.session_state["results"]
+
+    # =====================================================
+    # BATCH SUMMARY
+    # =====================================================
+
+    st.subheader("Batch Summary")
+
+    total = len(results)
+
+    successful = sum(
+        1
+        for r in results
+        if r["status"]
+        in [
+            "DEFECT DETECTED",
+            "NO DEFECT",
+        ]
     )
 
-    # -----------------------------------------------------
-    # Summary
-    # -----------------------------------------------------
-
-    successful = [
-        r for r in results
-        if r["status"] != "ERROR"
-    ]
-
-    failed = [
-        r for r in results
+    failed = sum(
+        1
+        for r in results
         if r["status"] == "ERROR"
-    ]
+    )
 
-    defects = [
-        r for r in successful
+    invalid = sum(
+        1
+        for r in results
+        if r["status"] == "INVALID INPUT"
+    )
+
+    defects = sum(
+        1
+        for r in results
         if r["status"] == "DEFECT DETECTED"
-    ]
+    )
 
-    clean = [
-        r for r in successful
+    clean = sum(
+        1
+        for r in results
         if r["status"] == "NO DEFECT"
-    ]
+    )
 
-    latencies = [
+    latency_values = [
         r["latency_ms"]
-        for r in successful
+        for r in results
         if r["latency_ms"] is not None
     ]
 
-    average_latency = (
-        sum(latencies) / len(latencies)
-        if latencies
-        else 0
-    )
+    if latency_values:
 
-    st.subheader("Batch Summary")
+        average_latency = (
+            sum(latency_values)
+            / len(latency_values)
+        )
+
+    else:
+
+        average_latency = 0.0
+
+    # -----------------------------------------------------
+    # Summary metrics
+    # -----------------------------------------------------
 
     col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        st.metric("Total", total)
+        st.metric(
+            "Total",
+            total,
+        )
 
     with col2:
-        st.metric("Successful", len(successful))
+        st.metric(
+            "Successful",
+            successful,
+        )
 
     with col3:
-        st.metric("Failed", len(failed))
+        st.metric(
+            "Invalid / Error",
+            invalid + failed,
+        )
 
     with col4:
-        st.metric("Defects", len(defects))
+        st.metric(
+            "Defects",
+            defects,
+        )
 
     with col5:
-        st.metric("Clean", len(clean))
+        st.metric(
+            "Clean",
+            clean,
+        )
 
     st.metric(
         "Average Inference Latency",
         f"{average_latency:.2f} ms",
     )
 
-    # -----------------------------------------------------
-    # Results table
-    # -----------------------------------------------------
+    # =====================================================
+    # CLASSIFICATION RESULTS
+    # =====================================================
 
     st.subheader("Classification Results")
 
@@ -385,47 +765,60 @@ def main():
 
         confidence = result["confidence"]
 
+        if confidence is None:
+            confidence_text = "—"
+        else:
+            confidence_text = (
+                f"{confidence * 100:.1f}%"
+            )
+
+        latency = result["latency_ms"]
+
+        if latency is None:
+            latency_text = "—"
+        else:
+            latency_text = (
+                f"{latency:.2f} ms"
+            )
+
         table_data.append(
             {
                 "Filename": result["filename"],
-                "Prediction": result["prediction"],
-                "Confidence": (
-                    f"{confidence * 100:.1f}%"
-                    if confidence is not None
-                    else "-"
+                "Prediction": (
+                    result["prediction"]
+                    if result["prediction"]
+                    else "—"
                 ),
+                "Confidence": confidence_text,
                 "Status": result["status"],
-                "Latency": (
-                    f"{result['latency_ms']:.2f} ms"
-                    if result["latency_ms"] is not None
-                    else "-"
-                ),
+                "Latency": latency_text,
                 "Error": result["error"],
             }
         )
 
     st.dataframe(
         table_data,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
-    # -----------------------------------------------------
-    # CSV download
-    # -----------------------------------------------------
+    # =====================================================
+    # CSV DOWNLOAD
+    # =====================================================
 
     csv_data = create_csv(results)
 
     st.download_button(
-        label="Download Results as CSV",
+        label="⬇️ Download Results as CSV",
         data=csv_data,
         file_name="sem_classification_results.csv",
         mime="text/csv",
+        width="stretch",
     )
 
-    # -----------------------------------------------------
-    # Class distribution
-    # -----------------------------------------------------
+    # =====================================================
+    # CLASS DISTRIBUTION
+    # =====================================================
 
     st.subheader("Class Distribution")
 
@@ -434,87 +827,201 @@ def main():
         for class_name in classes
     }
 
-    for result in successful:
+    for result in results:
 
         prediction = result["prediction"]
 
         if prediction in class_counts:
+
             class_counts[prediction] += 1
 
-    st.bar_chart(class_counts)
+    if any(
+        count > 0
+        for count in class_counts.values()
+    ):
 
-    # -----------------------------------------------------
-    # Individual image inspection
-    # -----------------------------------------------------
+        st.bar_chart(class_counts)
 
-    st.subheader("Inspect Individual Image")
+    else:
 
-    selectable_results = [
-        r for r in results
-        if r["image"] is not None
+        st.info(
+            "No valid SEM predictions available "
+            "for class distribution."
+        )
+
+    # =====================================================
+    # INPUT VALIDATION DETAILS
+    # =====================================================
+
+    invalid_results = [
+        r
+        for r in results
+        if r["status"] == "INVALID INPUT"
     ]
 
-    if selectable_results:
+    if invalid_results:
 
-        selected_filename = st.selectbox(
-            "Select an image",
-            [
-                r["filename"]
-                for r in selectable_results
-            ],
+        st.subheader("⚠️ Rejected Inputs")
+
+        st.warning(
+            "Some uploaded images were rejected before "
+            "ONNX inference because they did not appear "
+            "to be valid SEM images."
         )
 
-        selected = next(
-            r
-            for r in selectable_results
-            if r["filename"] == selected_filename
-        )
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            st.image(
-                selected["image"],
-                caption=selected["filename"],
-                width="stretch",
-            )
-
-        with col2:
+        for result in invalid_results:
 
             st.write(
-                f"### Prediction: {selected['prediction']}"
+                f"**{result['filename']}** — "
+                f"{result['error']}"
             )
 
-            st.write(
-                f"**Confidence:** "
-                f"{selected['confidence'] * 100:.2f}%"
-            )
+    # =====================================================
+    # ERROR DETAILS
+    # =====================================================
 
-            st.write(
-                f"**Status:** {selected['status']}"
-            )
+    error_results = [
+        r
+        for r in results
+        if r["status"] == "ERROR"
+    ]
 
-            st.write(
-                f"**Inference latency:** "
-                f"{selected['latency_ms']:.2f} ms"
-            )
+    if error_results:
 
-    # -----------------------------------------------------
-    # Errors
-    # -----------------------------------------------------
+        st.subheader("⚠️ Processing Errors")
 
-    if failed:
-
-        st.subheader("Files That Failed")
-
-        for result in failed:
+        for result in error_results:
 
             st.error(
                 f"{result['filename']}: "
                 f"{result['error']}"
             )
 
+    # =====================================================
+    # INDIVIDUAL IMAGE INSPECTION
+    # =====================================================
+
+    valid_images = [
+        r
+        for r in results
+        if r["image"] is not None
+    ]
+
+    if not valid_images:
+
+        return
+
+    st.subheader("Inspect Individual Image")
+
+    filenames = [
+        r["filename"]
+        for r in valid_images
+    ]
+
+    selected_filename = st.selectbox(
+        "Select an image",
+        filenames,
+    )
+
+    selected_result = next(
+        r
+        for r in valid_images
+        if r["filename"] == selected_filename
+    )
+
+    image_col, result_col = st.columns(
+        [2, 1]
+    )
+
+    # -----------------------------------------------------
+    # Image
+    # -----------------------------------------------------
+
+    with image_col:
+
+        st.image(
+            selected_result["image"],
+            caption=selected_result["filename"],
+            width="stretch",
+        )
+
+    # -----------------------------------------------------
+    # Result information
+    # -----------------------------------------------------
+
+    with result_col:
+
+        status = selected_result["status"]
+
+        if status == "DEFECT DETECTED":
+
+            st.error(
+                f"Status: {status}"
+            )
+
+        elif status == "NO DEFECT":
+
+            st.success(
+                f"Status: {status}"
+            )
+
+        elif status == "INVALID INPUT":
+
+            st.warning(
+                f"Status: {status}"
+            )
+
+        else:
+
+            st.error(
+                f"Status: {status}"
+            )
+
+        prediction = selected_result[
+            "prediction"
+        ]
+
+        if prediction:
+
+            st.metric(
+                "Prediction",
+                prediction,
+            )
+
+        confidence = selected_result[
+            "confidence"
+        ]
+
+        if confidence is not None:
+
+            st.metric(
+                "Confidence",
+                f"{confidence * 100:.1f}%",
+            )
+
+        latency = selected_result[
+            "latency_ms"
+        ]
+
+        if latency is not None:
+
+            st.metric(
+                "Inference Latency",
+                f"{latency:.2f} ms",
+            )
+
+        error = selected_result[
+            "error"
+        ]
+
+        if error:
+
+            st.info(error)
+
+
+# =========================================================
+# APPLICATION ENTRY POINT
+# =========================================================
 
 if __name__ == "__main__":
     main()
