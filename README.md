@@ -2,7 +2,9 @@
 
 ### Edge AI Semiconductor Defect Classification from SEM Images
 
-**THE-DOPED-MINDS** is an Edge AI system for automatically classifying semiconductor defects from **Scanning Electron Microscope (SEM) images**. The project combines a CNN-based computer vision model, burst-aware dataset splitting, ONNX model optimization, and a Streamlit deployment for fast CPU inference.
+**THE-DOPED-MINDS** is an Edge AI-based computer vision system designed to automatically classify semiconductor defects from **Scanning Electron Microscope (SEM) images**.
+
+The project combines a lightweight CNN, leakage-aware dataset splitting, ONNX model optimization, and a Streamlit web application to provide fast CPU-based inference.
 
 🌐 **Live Demo:** https://infersem.streamlit.app/
 
@@ -10,241 +12,346 @@
 
 ## 🚀 Overview
 
-Manual inspection of semiconductor SEM images can be time-consuming and prone to inconsistencies. This project provides an automated inference pipeline that:
+Manual inspection of semiconductor SEM images can be time-consuming and may introduce inconsistencies.
 
-* Accepts one or multiple SEM images
-* Validates uploaded inputs before inference
-* Classifies semiconductor defects using a trained CNN
-* Identifies **defect vs. clean** samples
-* Reports prediction confidence
-* Measures per-image inference latency
-* Processes images using **ONNX Runtime on CPU**
-* Provides batch-level statistics
-* Allows classification results to be exported as CSV
+THE-DOPED-MINDS automates this process by allowing users to upload SEM images and obtain:
 
-The deployed application is intentionally **PyTorch-free at runtime**, using the exported ONNX model for lightweight inference.
+* Semiconductor defect classification
+* Defect vs. clean identification
+* Prediction confidence
+* Per-image inference latency
+* Batch-level classification statistics
+* Class distribution analysis
+* CSV export of prediction results
+
+The production application uses **ONNX Runtime** instead of PyTorch for lightweight and fast CPU inference.
 
 ---
 
-## 🎯 Supported Defect Classes
+## ✨ Key Features
 
-The trained model classifies SEM images into **8 categories**:
+* 🧠 **CNN-based SEM defect classification**
+* 🔬 **8-class semiconductor defect detection**
+* ⚡ **ONNX Runtime CPU inference**
+* 📊 **Confidence score for predictions**
+* ⏱️ **Per-image inference latency measurement**
+* 📦 **Batch image processing**
+* 📈 **Class distribution visualization**
+* 📥 **CSV result export**
+* 🛡️ **Input validation and error handling**
+* 🔒 **Burst-aware train/validation splitting**
+* 🌐 **Streamlit web deployment**
+
+---
+
+## 🎯 Problem Statement
+
+Semiconductor manufacturing requires accurate inspection of microscopic structures for identifying defects such as opens, shorts, cracks, scratches, and line-edge irregularities.
+
+Traditional manual inspection can be:
+
+* Time-consuming
+* Difficult to scale
+* Dependent on human expertise
+* Inconsistent for large image volumes
+
+This project explores an **Edge AI approach** for automated SEM image classification that can eventually be deployed on resource-constrained systems and semiconductor inspection pipelines.
+
+---
+
+# 📂 Dataset
+
+The dataset contains SEM images representing **8 semiconductor classes**.
+
+### Dataset Structure
+
+```text
+DATASET/
+├── Bridge/
+├── CMP scratch/
+├── Clean/
+├── LER/
+├── crack/
+├── manforsed via/
+├── open/
+└── short/
+```
+
+### Dataset Information
+
+| Property     | Value                      |
+| ------------ | -------------------------- |
+| Total images | 333                        |
+| Classes      | 8                          |
+| Image type   | SEM images                 |
+| Task         | Multi-class classification |
+| Input        | SEM image                  |
+| Output       | Defect class               |
+
+### Classes
 
 | Class           | Description                      |
 | --------------- | -------------------------------- |
 | `Bridge`        | Bridge-type semiconductor defect |
 | `CMP scratch`   | CMP-related scratch defect       |
-| `Clean`         | No detected defect               |
+| `Clean`         | Defect-free sample               |
 | `LER`           | Line Edge Roughness              |
 | `crack`         | Crack defect                     |
 | `manforsed via` | Manforsed-via defect             |
 | `open`          | Open-circuit type defect         |
 | `short`         | Short-circuit type defect        |
 
-`Clean` is treated as the **no-defect** class; all other classes are considered defects.
+📥 **[Download Dataset from Google Drive](https://drive.google.com/drive/folders/1uJ59JvSptqp9oR6rq_7sxr1ShFq_4B-i?usp=sharing)**
+
+> The dataset is hosted separately from the source code and is not included directly in the GitHub repository.
 
 ---
 
-## 🧠 Model Architecture
+# 🧠 Model Architecture
 
-The classification model is a lightweight custom CNN trained from scratch.
+The project uses a lightweight custom **Convolutional Neural Network (CNN)** trained for SEM image classification.
 
 ### Architecture
 
 ```text
-Input Image
-   │
-   ▼
-96 × 96 × 3
-   │
-   ▼
-Conv2D (16) + BatchNorm + ReLU
-   │
-   ▼
+Input SEM Image
+      │
+      ▼
+Resize → 96 × 96 × 3
+      │
+      ▼
+Conv2D (16)
+BatchNorm
+ReLU
+      │
+      ▼
 MaxPool
-   │
-   ▼
-Conv2D (32) + BatchNorm + ReLU
-   │
-   ▼
+      │
+      ▼
+Conv2D (32)
+BatchNorm
+ReLU
+      │
+      ▼
 MaxPool
-   │
-   ▼
-Conv2D (64) + BatchNorm + ReLU
-   │
-   ▼
+      │
+      ▼
+Conv2D (64)
+BatchNorm
+ReLU
+      │
+      ▼
 MaxPool
-   │
-   ▼
-Conv2D (64) + BatchNorm + ReLU
-   │
-   ▼
+      │
+      ▼
+Conv2D (64)
+BatchNorm
+ReLU
+      │
+      ▼
 MaxPool
-   │
-   ▼
+      │
+      ▼
 Fully Connected (128)
-   │
-   ▼
+      │
+      ▼
 Dropout
-   │
-   ▼
+      │
+      ▼
 8-Class Output
 ```
 
-Images are resized to **96 × 96** and normalized using ImageNet-style mean and standard deviation values.
+### Image Preprocessing
+
+Input images are:
+
+1. Loaded using Pillow
+2. Converted to RGB
+3. Resized to **96 × 96**
+4. Converted to tensors
+5. Normalized using ImageNet-style normalization
 
 ---
 
-## ⚡ Edge AI / ONNX Optimization
+# 🔬 Burst-Aware Dataset Splitting
 
-The trained PyTorch model was exported to **ONNX** and executed using **ONNX Runtime**.
+A major focus of the project is preventing **data leakage caused by near-duplicate SEM images**.
 
-This allows the deployed application to avoid loading PyTorch and the original training checkpoint.
+SEM acquisition systems can capture multiple images within a short time period. Randomly splitting these images can result in images from the same acquisition burst appearing in both training and validation sets.
 
-### Deployment Pipeline
+This can lead to artificially high validation performance.
 
-```text
-SEM Image
-    │
-    ▼
-Input Validation
-    │
-    ▼
-Image Preprocessing
-    │
-    ▼
-ONNX Runtime
-    │
-    ▼
-CNN Inference
-    │
-    ▼
-Softmax Probabilities
-    │
-    ▼
-Predicted Defect Class
-    │
-    ├── Confidence
-    ├── Defect / Clean Status
-    └── Inference Latency
-```
-
----
-
-## 🔍 Dataset Leakage Prevention
-
-A major part of the project was addressing **near-duplicate / burst leakage**.
-
-SEM images can be captured as bursts within seconds of one another. A naive random train/validation split can therefore place highly similar images from the same burst into both sets, producing artificially optimistic validation results.
-
-To prevent this, the project implements a **burst-aware split**:
+### Approach
 
 ```text
 SEM Dataset
      │
      ▼
-Group temporally related images
+Identify temporally related images
      │
      ▼
-Keep entire bursts together
+Group images into bursts
      │
-     ├──────────────┐
-     ▼              ▼
- Train Split     Validation Split
+     ▼
+Keep complete bursts together
+     │
+     ├───────────────┐
+     ▼               ▼
+ Training Set    Validation Set
 ```
 
-This provides a more realistic evaluation of generalization.
+This provides a more realistic estimate of model generalization.
 
 ---
 
-## 📊 Verified Results
-
-### Model Evaluation
+# 📊 Model Performance
 
 The burst-aware validation set contains **101 images**.
 
-* **Accuracy:** 98.02%
-* **Macro Precision:** 0.9797
-* **Macro Recall:** 0.9797
-* **Macro F1:** 0.9790
-* **Validation errors:** 2
+### Validation Results
+
+| Metric            |      Score |
+| ----------------- | ---------: |
+| Accuracy          | **98.02%** |
+| Macro Precision   | **0.9797** |
+| Macro Recall      | **0.9797** |
+| Macro F1          | **0.9790** |
+| Validation Errors |      **2** |
+
+> These results are based on the burst-aware validation split and should not be interpreted as performance on a completely independent external dataset.
+
+---
+
+# ⚡ ONNX Optimization
+
+After training, the PyTorch model is exported to **ONNX** for production inference.
+
+### Deployment Pipeline
+
+```text
+PyTorch CNN
+     │
+     ▼
+ONNX Export
+     │
+     ▼
+ONNX Model
+     │
+     ▼
+ONNX Runtime
+     │
+     ▼
+CPU Inference
+```
+
+This removes the need to load the full PyTorch training stack during deployment.
 
 ### PyTorch vs ONNX
 
-The exported ONNX model was verified against the original PyTorch model on the same validation images.
+The ONNX model was verified against the original PyTorch model using the same validation images.
 
 | Metric               |            Result |
 | -------------------- | ----------------: |
-| Prediction agreement |          **100%** |
-| PyTorch latency      |     2.88 ms/image |
-| ONNX Runtime latency | **0.63 ms/image** |
-| Speed improvement    |        **~4.53×** |
+| Prediction Agreement |          **100%** |
+| PyTorch Latency      |     2.88 ms/image |
+| ONNX Runtime Latency | **0.63 ms/image** |
+| Approx. Speedup      |         **4.53×** |
 
-The ONNX model therefore preserves prediction behavior while providing substantially faster CPU inference.
+The ONNX model maintained prediction consistency while providing significantly faster CPU inference in the benchmark.
 
 ---
 
-## 🌐 Streamlit Application
+# 🌐 Streamlit Application
 
-The deployed web application provides an interactive interface for SEM defect analysis.
+The project is deployed as an interactive Streamlit application.
 
-### Features
-
-* 📤 Single or multiple image upload
-* 🔍 SEM/non-SEM input validation
-* 🤖 ONNX Runtime inference
-* 📈 Prediction confidence
-* ⚠️ Defect / clean classification
-* ⚡ Per-image latency measurement
-* 📊 Batch summary
-* 📋 Classification results table
-* 📉 Class distribution
-* 🖼️ Individual image inspection
-* 📥 CSV result export
-* ❌ Graceful handling of invalid/corrupt inputs
-
-### Live Application
+### 🔗 Live Demo
 
 **https://infersem.streamlit.app/**
 
+### Application Workflow
+
+```text
+Upload SEM Image(s)
+        │
+        ▼
+Input Validation
+        │
+        ▼
+Image Preprocessing
+        │
+        ▼
+ONNX Runtime
+        │
+        ▼
+CNN Prediction
+        │
+        ▼
+Prediction + Confidence
+        │
+        ├── Defect / Clean
+        ├── Inference Latency
+        └── Batch Statistics
+```
+
+### Application Capabilities
+
+Users can:
+
+* Upload one or multiple images
+* Run classification
+* View predicted classes
+* View confidence scores
+* View inference latency
+* Identify defect/clean status
+* Analyze class distribution
+* Inspect individual predictions
+* Download results as CSV
+
 ---
 
-## 🛠️ Tech Stack
+# 🛠️ Tech Stack
 
-**Programming**
+### Programming
 
 * Python
 
-**Machine Learning / Computer Vision**
+### Machine Learning
 
 * PyTorch
-* CNN
+* Convolutional Neural Networks
 * Computer Vision
 * Image Classification
 
-**Model Optimization & Deployment**
+### Model Deployment
 
 * ONNX
 * ONNX Runtime
 
-**Web Application**
+### Web Application
 
 * Streamlit
 
-**Image Processing**
+### Image Processing
 
 * Pillow
 * NumPy
 
-**Testing & Evaluation**
+### Testing & Evaluation
 
 * PyTest
 * Model benchmarking
-* PyTorch vs ONNX prediction verification
+* PyTorch vs ONNX verification
+
+### Development Tools
+
+* Git
+* GitHub
+* VS Code
 
 ---
 
-## 📁 Project Structure
+# 📁 Project Structure
 
 ```text
 THE-DOPED-MINDS/
@@ -287,20 +394,22 @@ THE-DOPED-MINDS/
 
 ---
 
-## ⚙️ Installation
+# ⚙️ Installation
 
-### Full Development Environment
+Clone the repository:
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
+git clone <YOUR_GITHUB_REPOSITORY_URL>
 cd THE-DOPED-MINDS
+```
 
+Install the development dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-### Deployment / Inference Environment
-
-The Streamlit application only requires the lightweight inference dependencies:
+For lightweight application deployment:
 
 ```bash
 pip install -r requirements-app.txt
@@ -308,27 +417,33 @@ pip install -r requirements-app.txt
 
 ---
 
-## ▶️ Run Locally
+# ▶️ Run the Application Locally
 
-Start the Streamlit application:
+Start Streamlit:
 
 ```bash
 streamlit run app.py
 ```
 
-Then open the local Streamlit URL shown in the terminal.
+The application will open at the local Streamlit URL displayed in the terminal.
 
-Upload one or more SEM images and click:
-
-```text
-🚀 Run Classification
-```
+Upload one or more SEM images and run the classifier.
 
 ---
 
-## 🧪 Reproduce the Training Pipeline
+# 🧪 Training Pipeline
 
-### 1. Create Burst-Aware Dataset Split
+### Step 1 — Download Dataset
+
+Download the dataset from:
+
+**[Google Drive Dataset](https://drive.google.com/drive/folders/1uJ59JvSptqp9oR6rq_7sxr1ShFq_4B-i?usp=sharing)**
+
+Extract it into the required dataset directory.
+
+---
+
+### Step 2 — Create Burst-Aware Split
 
 ```bash
 python make_burst_split.py \
@@ -339,7 +454,9 @@ python make_burst_split.py \
     --seed 42
 ```
 
-### 2. Train the CNN
+---
+
+### Step 3 — Train the Model
 
 ```bash
 python train_sem_burst.py \
@@ -352,7 +469,9 @@ python train_sem_burst.py \
     --output best_sem_model_burst.pth
 ```
 
-### 3. Evaluate
+---
+
+### Step 4 — Evaluate
 
 ```bash
 python evaluate.py \
@@ -361,7 +480,9 @@ python evaluate.py \
     --dataset sem
 ```
 
-### 4. Export to ONNX
+---
+
+### Step 5 — Export to ONNX
 
 ```bash
 python export_onnx_sem.py \
@@ -370,7 +491,9 @@ python export_onnx_sem.py \
     --onnx_path model_sem_burst.onnx
 ```
 
-### 5. Verify PyTorch vs ONNX
+---
+
+### Step 6 — Verify ONNX Predictions
 
 ```bash
 python compare_pytorch_onnx.py \
@@ -382,62 +505,109 @@ python compare_pytorch_onnx.py \
 
 ---
 
-## 🧪 Testing
+# 🧪 Testing
 
-Run the test suite with:
+Run the test suite:
 
 ```bash
 pytest tests/
 ```
 
-The tests cover core defect detection behavior and input handling.
+The tests cover core inference and input-handling behavior.
 
 ---
 
-## 📈 Why ONNX?
+# 📈 Why ONNX?
 
-The deployment model uses ONNX Runtime instead of PyTorch because it provides:
+ONNX Runtime was selected for production inference because it provides:
 
-* Lightweight inference
-* CPU-friendly execution
-* Lower deployment overhead
-* Faster inference in the measured benchmark
-* Separation between training and production inference
-* No need to ship the PyTorch training stack to the deployed application
+* Lightweight CPU inference
+* Reduced deployment dependencies
+* Faster measured inference
+* Lower runtime overhead
+* Easy separation between training and deployment
+* Compatibility with future edge-device deployment
 
-The application therefore follows a simple **train → export → deploy → infer** workflow.
+The resulting workflow is:
 
----
-
-## ⚠️ Limitations
-
-* The dataset contains only **324 images**, so the model requires further validation on larger datasets.
-* Some classes have limited validation examples.
-* The burst-aware validation split contains approximately **31%** of the dataset because complete bursts must remain together.
-* Only one training seed has been evaluated.
-* The current metrics are based on the burst-aware validation split rather than a completely independent external test set.
-* The SEM input validator is a basic safety filter, **not a dedicated SEM-vs-non-SEM machine-learning classifier**.
+```text
+Train → Evaluate → Export → Optimize → Deploy → Infer
+```
 
 ---
 
-## 🔮 Future Improvements
+# ⚠️ Limitations
 
-* Expand the dataset with more SEM samples
-* Add an independent external test set
-* Evaluate multiple random seeds
-* Improve minority-class performance
-* Add model explainability such as Grad-CAM
-* Optimize the model further for edge hardware
-* Add quantization for smaller/faster inference
-* Introduce automated model monitoring
-* Deploy on dedicated edge hardware for real-time semiconductor inspection
+* The current dataset contains **333 images**, which is relatively small for a production-grade computer vision system.
+* Some defect classes have limited samples.
+* The burst-aware validation strategy reduces the number of images available for validation because complete acquisition bursts must remain together.
+* The reported metrics are based on a validation split rather than an independent external benchmark.
+* Only a limited number of training configurations/seeds have been evaluated.
+* Real-world semiconductor inspection environments may contain variations in imaging conditions, equipment, resolution, and sample preparation.
 
 ---
 
-## 👨‍💻 Project
+# 🔮 Future Improvements
 
-**THE-DOPED-MINDS**
+* 📚 Expand the SEM dataset
+* 🧪 Add an independent external test set
+* 🔁 Evaluate multiple training seeds
+* ⚖️ Improve minority-class performance
+* 🔍 Add Grad-CAM/model explainability
+* 🧮 Introduce INT8 quantization
+* ⚡ Optimize the model for edge hardware
+* 📦 Package the inference engine for embedded deployment
+* 📊 Add model monitoring and drift detection
+* 🏭 Integrate with automated semiconductor inspection workflows
 
-An Edge AI approach to automated semiconductor SEM defect classification, combining **CNN-based computer vision, leakage-aware evaluation, ONNX optimization, and real-time web inference**.
+---
 
-🌐 **Live Demo:** https://infersem.streamlit.app/
+# 📌 Key Takeaways
+
+THE-DOPED-MINDS demonstrates an end-to-end **Edge AI computer vision pipeline**:
+
+```text
+SEM Dataset
+     ↓
+Leakage-Aware Data Splitting
+     ↓
+CNN Training
+     ↓
+Model Evaluation
+     ↓
+ONNX Export
+     ↓
+CPU Optimization
+     ↓
+Streamlit Deployment
+     ↓
+Real-Time SEM Defect Classification
+```
+
+The project achieves **98.02% validation accuracy**, maintains **100% PyTorch–ONNX prediction agreement**, and achieves approximately **4.53× faster measured inference** using ONNX Runtime.
+
+---
+
+# 🌐 Links
+
+| Resource       | Link                                                                                                 |
+| -------------- | ---------------------------------------------------------------------------------------------------- |
+| 🚀 Live Demo   | https://infersem.streamlit.app/                                                                      |
+| 📂 Dataset     | [Google Drive](https://drive.google.com/drive/folders/1uJ59JvSptqp9oR6rq_7sxr1ShFq_4B-i?usp=sharing) |
+| 💻 Source Code | `<YOUR_GITHUB_REPOSITORY_URL>`                                                                       |
+
+---
+
+# 👨‍💻 Author
+
+**Prajjwal Gupta**
+
+B.Tech — ECE (VLSI Design & Technology)
+Maharaja Agrasen Institute of Technology (MAIT)
+GGSIPU
+
+---
+
+## ⭐ If you find this project useful
+
+Consider giving the repository a ⭐ and sharing feedback or suggestions for improving the semiconductor defect classification pipeline.
